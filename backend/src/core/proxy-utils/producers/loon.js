@@ -93,7 +93,9 @@ function trojan(proxy) {
     result.append(
         `${proxy.name}=trojan,${proxy.server},${proxy.port},"${proxy.password}"`,
     );
-
+    if (proxy.network === 'tcp') {
+        delete proxy.network;
+    }
     // transport
     if (isPresent(proxy, 'network')) {
         if (proxy.network === 'ws') {
@@ -134,7 +136,9 @@ function vmess(proxy) {
     result.append(
         `${proxy.name}=vmess,${proxy.server},${proxy.port},${proxy.cipher},"${proxy.uuid}"`,
     );
-
+    if (proxy.network === 'tcp') {
+        delete proxy.network;
+    }
     // transport
     if (isPresent(proxy, 'network')) {
         if (proxy.network === 'ws') {
@@ -195,13 +199,15 @@ function vmess(proxy) {
 
 function vless(proxy) {
     if (proxy['reality-opts']) {
-        throw new Error(`reality is unsupported`);
+        throw new Error(`VLESS REALITY is unsupported`);
     }
     const result = new Result(proxy);
     result.append(
         `${proxy.name}=vless,${proxy.server},${proxy.port},"${proxy.uuid}"`,
     );
-
+    if (proxy.network === 'tcp') {
+        delete proxy.network;
+    }
     // transport
     if (isPresent(proxy, 'network')) {
         if (proxy.network === 'ws') {
@@ -285,7 +291,8 @@ function wireguard(proxy) {
         proxy.ipv6 = proxy.peers[0].ipv6;
         proxy['public-key'] = proxy.peers[0]['public-key'];
         proxy['preshared-key'] = proxy.peers[0]['pre-shared-key'];
-        proxy['allowed-ips'] = proxy.peers[0]['allowed_ips'];
+        // https://github.com/MetaCubeX/mihomo/blob/0404e35be8736b695eae018a08debb175c1f96e6/docs/config.yaml#L717
+        proxy['allowed-ips'] = proxy.peers[0]['allowed-ips'];
         proxy.reserved = proxy.peers[0].reserved;
     }
     const result = new Result(proxy);

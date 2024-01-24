@@ -3,13 +3,17 @@ import { findByName } from '@/utils/database';
 import { HTTP, ENV } from '@/vendor/open-api';
 import { hex_md5 } from '@/vendor/md5';
 import resourceCache from '@/utils/resource-cache';
+import headersResourceCache from '@/utils/headers-resource-cache';
+import { getFlowField } from '@/utils/flow';
 import $ from '@/core/app';
 
 const tasks = new Map();
 
-export default async function download(url, ua) {
+export default async function download(rawUrl, ua, timeout) {
     let $arguments = {};
+    let url = rawUrl.replace(/#noFlow$/, '');
     const rawArgs = url.split('#');
+    url = url.split('#')[0];
     if (rawArgs.length > 1) {
         try {
             // 支持 `#${encodeURIComponent(JSON.stringify({arg1: "1"}))}`
@@ -45,17 +49,19 @@ export default async function download(url, ua) {
     }
 
     const { isNode } = ENV();
-    const { defaultUserAgent } = $.read(SETTINGS_KEY);
-    ua = ua || defaultUserAgent || 'clash.meta';
-    const id = hex_md5(ua + url);
+    const { defaultUserAgent, defaultTimeout } = $.read(SETTINGS_KEY);
+    const userAgent = ua || defaultUserAgent || 'clash.meta';
+    const requestTimeout = timeout || defaultTimeout;
+    const id = hex_md5(userAgent + url);
     if (!isNode && tasks.has(id)) {
         return tasks.get(id);
     }
 
     const http = HTTP({
         headers: {
-            'User-Agent': ua,
+            'User-Agent': userAgent,
         },
+        timeout: requestTimeout,
     });
 
     const result = new Promise((resolve, reject) => {
@@ -64,10 +70,18 @@ export default async function download(url, ua) {
         if (!$arguments?.noCache && cached) {
             resolve(cached);
         } else {
-            $.info(`Downloading...\nUser-Agent: ${ua}\nURL: ${url}`);
+            $.info(
+                `Downloading...\nUser-Agent: ${userAgent}\nTimeout: ${requestTimeout}\nURL: ${url}`,
+            );
             http.get(url)
                 .then((resp) => {
-                    const body = resp.body;
+                    const { body, headers } = resp;
+                    if (headers) {
+                        const flowInfo = getFlowField(headers);
+                        if (flowInfo) {
+                            headersResourceCache.set(url, flowInfo);
+                        }
+                    }
                     if (body.replace(/\s/g, '').length === 0)
                         reject(new Error('远程资源内容为空！'));
                     else {

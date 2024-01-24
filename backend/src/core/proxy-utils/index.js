@@ -1,5 +1,6 @@
+import YAML from 'static-js-yaml';
 import download from '@/utils/download';
-import { isIPv4, isIPv6 } from '@/utils';
+import { isIPv4, isIPv6, isValidPortNumber } from '@/utils';
 import PROXY_PROCESSORS, { ApplyProcessor } from './processors';
 import PROXY_PREPROCESSORS from './preprocessors';
 import PROXY_PRODUCERS from './producers';
@@ -59,7 +60,6 @@ function parse(raw) {
             $.error(`Failed to parse line: ${line}`);
         }
     }
-
     return proxies;
 }
 
@@ -139,7 +139,7 @@ async function process(proxies, operators = [], targetPlatform, source) {
     return proxies;
 }
 
-function produce(proxies, targetPlatform, type) {
+function produce(proxies, targetPlatform, type, opts = {}) {
     const producer = PROXY_PRODUCERS[targetPlatform];
     if (!producer) {
         throw new Error(`Target platform: ${targetPlatform} is not supported!`);
@@ -154,10 +154,10 @@ function produce(proxies, targetPlatform, type) {
     $.info(`Producing proxies for target: ${targetPlatform}`);
     if (typeof producer.type === 'undefined' || producer.type === 'SINGLE') {
         let localPort = 10000;
-        return proxies
+        const list = proxies
             .map((proxy) => {
                 try {
-                    let line = producer.produce(proxy, type);
+                    let line = producer.produce(proxy, type, opts);
                     if (
                         line.length > 0 &&
                         line.includes('__SubStoreLocalPort__')
@@ -179,10 +179,10 @@ function produce(proxies, targetPlatform, type) {
                     return '';
                 }
             })
-            .filter((line) => line.length > 0)
-            .join('\n');
+            .filter((line) => line.length > 0);
+        return type === 'internal' ? list : list.join('\n');
     } else if (producer.type === 'ALL') {
-        return producer.produce(proxies, type);
+        return producer.produce(proxies, type, opts);
     }
 }
 
@@ -193,6 +193,7 @@ export const ProxyUtils = {
     isIPv4,
     isIPv6,
     isIP,
+    yaml: YAML,
 };
 
 function tryParse(parser, line) {
@@ -214,15 +215,36 @@ function safeMatch(parser, line) {
 }
 
 function lastParse(proxy) {
+    if (isValidPortNumber(proxy.port)) {
+        proxy.port = parseInt(proxy.port, 10);
+    }
     if (proxy.server) {
-        proxy.server = proxy.server
+        proxy.server = `${proxy.server}`
             .trim()
             .replace(/^\[/, '')
             .replace(/\]$/, '');
     }
+    if (proxy.network === 'ws') {
+        if (!proxy['ws-opts'] && (proxy['ws-path'] || proxy['ws-headers'])) {
+            proxy['ws-opts'] = {};
+            if (proxy['ws-path']) {
+                proxy['ws-opts'].path = proxy['ws-path'];
+            }
+            if (proxy['ws-headers']) {
+                proxy['ws-opts'].headers = proxy['ws-headers'];
+            }
+        }
+        delete proxy['ws-path'];
+        delete proxy['ws-headers'];
+    }
     if (proxy.type === 'trojan') {
         if (proxy.network === 'tcp') {
             delete proxy.network;
+        }
+    }
+    if (['vless'].includes(proxy.type)) {
+        if (!proxy.network) {
+            proxy.network = 'tcp';
         }
     }
     if (['trojan', 'tuic', 'hysteria', 'hysteria2'].includes(proxy.type)) {

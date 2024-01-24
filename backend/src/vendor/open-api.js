@@ -191,6 +191,32 @@ export class OpenAPI {
                 (openURL ? `\n点击跳转: ${openURL}` : '') +
                 (mediaURL ? `\n多媒体: ${mediaURL}` : '');
             console.log(`${title}\n${subtitle}\n${content_}\n\n`);
+
+            let push = eval('process.env.SUB_STORE_PUSH_SERVICE');
+            if (push) {
+                const url = push
+                    .replace(
+                        '[推送标题]',
+                        encodeURIComponent(title || 'Sub-Store'),
+                    )
+                    .replace(
+                        '[推送内容]',
+                        encodeURIComponent(
+                            [subtitle, content_].map((i) => i).join('\n'),
+                        ),
+                    );
+                const $http = HTTP();
+                $http
+                    .get({ url })
+                    .then((resp) => {
+                        console.log(
+                            `[Push Service] URL: ${url}\nRES: ${resp.statusCode} ${resp.body}`,
+                        );
+                    })
+                    .catch((e) => {
+                        console.log(`[Push Service] URL: ${url}\nERROR: ${e}`);
+                    });
+            }
         }
     }
 
@@ -288,6 +314,17 @@ export function HTTP(defaultOptions = { baseURL: '' }) {
                 request[method.toLowerCase()](
                     options,
                     (err, response, body) => {
+                        // if (err) {
+                        //     console.log(err);
+                        // } else {
+                        //     console.log({
+                        //         statusCode:
+                        //             response.status || response.statusCode,
+                        //         headers: response.headers,
+                        //         body,
+                        //     });
+                        // }
+
                         if (err) reject(err);
                         else
                             resolve({

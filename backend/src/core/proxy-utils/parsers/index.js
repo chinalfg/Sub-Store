@@ -1,4 +1,11 @@
-import { getIfNotBlank, isPresent, isNotBlank, getIfPresent } from '@/utils';
+import {
+    isIPv4,
+    isIPv6,
+    getIfNotBlank,
+    isPresent,
+    isNotBlank,
+    getIfPresent,
+} from '@/utils';
 import getSurgeParser from './peggy/surge';
 import getLoonParser from './peggy/loon';
 import getQXParser from './peggy/qx';
@@ -331,12 +338,27 @@ function URI_VLESS() {
     };
     const parse = (line) => {
         line = line.split('vless://')[1];
+        let isShadowrocket;
+        let parsed = /^(.*?)@(.*?):(\d+)\/?(\?(.*?))?(?:#(.*?))?$/.exec(line);
+        if (!parsed) {
+            // eslint-disable-next-line no-unused-vars
+            let [_, base64, other] = /^(.*?)(\?.*?$)/.exec(line);
+            line = `${Base64.decode(base64)}${other}`;
+            parsed = /^(.*?)@(.*?):(\d+)\/?(\?(.*?))?(?:#(.*?))?$/.exec(line);
+            isShadowrocket = true;
+        }
         // eslint-disable-next-line no-unused-vars
-        let [__, uuid, server, port, addons, name] =
-            /^(.*?)@(.*?):(\d+)\/?\?(.*?)(?:#(.*?))$/.exec(line);
+        let [__, uuid, server, port, ___, addons = '', name] = parsed;
+        if (isShadowrocket) {
+            uuid = uuid.replace(/^.*?:/g, '');
+        }
+
         port = parseInt(`${port}`, 10);
         uuid = decodeURIComponent(uuid);
-        name = decodeURIComponent(name) ?? `VLESS ${server}:${port}`;
+        if (name != null) {
+            name = decodeURIComponent(name);
+        }
+
         const proxy = {
             type: 'vless',
             name,
@@ -352,9 +374,24 @@ function URI_VLESS() {
             params[key] = value;
         }
 
+        proxy.name = name ?? params.remarks ?? `VLESS ${server}:${port}`;
+
         proxy.tls = params.security && params.security !== 'none';
-        proxy.sni = params.sni;
+        if (isShadowrocket && /TRUE|1/i.test(params.tls)) {
+            proxy.tls = true;
+            params.security = params.security ?? 'reality';
+        }
+        proxy.sni = params.sni ?? params.peer;
         proxy.flow = params.flow;
+        if (!proxy.flow && isShadowrocket && params.xtls) {
+            // "none" is undefined
+            const flow = [undefined, 'xtls-rprx-direct', 'xtls-rprx-vision'][
+                params.xtls
+            ];
+            if (flow) {
+                proxy.flow = flow;
+            }
+        }
         proxy['client-fingerprint'] = params.fp;
         proxy.alpn = params.alpn ? params.alpn.split(',') : undefined;
         proxy['skip-cert-verify'] = /(TRUE)|1/i.test(params.allowInsecure);
@@ -368,21 +405,30 @@ function URI_VLESS() {
                 opts['short-id'] = params.sid;
             }
             if (Object.keys(opts).length > 0) {
+                // proxy[`${params.security}-opts`] = opts;
                 proxy[`${params.security}-opts`] = opts;
             }
         }
-
         proxy.network = params.type;
+        if (proxy.network === 'tcp' && params.headerType === 'http') {
+            proxy.network = 'http';
+        }
+        if (!proxy.network && isShadowrocket && params.obfs) {
+            proxy.network = params.obfs;
+        }
         if (proxy.network && !['tcp', 'none'].includes(proxy.network)) {
             const opts = {};
-            if (params.path) {
-                opts.path = params.path;
-            }
             if (params.host) {
                 opts.headers = { Host: params.host };
             }
             if (params.serviceName) {
                 opts[`${proxy.network}-service-name`] = params.serviceName;
+            } else if (isShadowrocket && params.path) {
+                opts[`${proxy.network}-service-name`] = params.path;
+                delete params.path;
+            }
+            if (params.path) {
+                opts.path = params.path;
             }
             // https://github.com/XTLS/Xray-core/issues/91
             if (['grpc'].includes(proxy.network)) {
@@ -414,14 +460,17 @@ function URI_Hysteria2() {
     const parse = (line) => {
         line = line.split(/(hysteria2|hy2):\/\//)[2];
         // eslint-disable-next-line no-unused-vars
-        let [__, password, server, ___, port, addons, name] =
-            /^(.*?)@(.*?)(:(\d+))?\/?\?(.*?)(?:#(.*?))$/.exec(line);
+        let [__, password, server, ___, port, ____, addons = '', name] =
+            /^(.*?)@(.*?)(:(\d+))?\/?(\?(.*?))?(?:#(.*?))?$/.exec(line);
         port = parseInt(`${port}`, 10);
         if (isNaN(port)) {
             port = 443;
         }
         password = decodeURIComponent(password);
-        name = decodeURIComponent(name) ?? `Hysteria2 ${server}:${port}`;
+        if (name != null) {
+            name = decodeURIComponent(name);
+        }
+        name = name ?? `Hysteria2 ${server}:${port}`;
 
         const proxy = {
             type: 'hysteria2',
@@ -529,6 +578,10 @@ function Clash_All() {
             }
         }
 
+        if (proxy.fingerprint) {
+            proxy['tls-fingerprint'] = proxy.fingerprint;
+        }
+
         if (proxy['benchmark-url']) {
             proxy['test-url'] = proxy['benchmark-url'];
         }
@@ -569,6 +622,15 @@ function QX_VMess() {
     const name = 'QX VMess Parser';
     const test = (line) => {
         return /^vmess\s*=/.test(line.split(',')[0].trim());
+    };
+    const parse = (line) => getQXParser().parse(line);
+    return { name, test, parse };
+}
+
+function QX_VLESS() {
+    const name = 'QX VLESS Parser';
+    const test = (line) => {
+        return /^vless\s*=/.test(line.split(',')[0].trim());
     };
     const parse = (line) => getQXParser().parse(line);
     return { name, test, parse };
@@ -742,6 +804,7 @@ function Loon_WireGuard() {
         let publicKey = peers.match(
             /(,|^)\s*?public-key\s*?=\s*?"?(.+?)"?\s*?(,|$)/i,
         )?.[2];
+        // https://github.com/MetaCubeX/mihomo/blob/0404e35be8736b695eae018a08debb175c1f96e6/docs/config.yaml#L717
         const proxy = {
             type: 'wireguard',
             name,
@@ -768,7 +831,7 @@ function Loon_WireGuard() {
                     ipv6,
                     'public-key': publicKey,
                     'pre-shared-key': preSharedKey,
-                    allowed_ips: allowedIps,
+                    'allowed-ips': allowedIps,
                     reserved,
                 },
             ],
@@ -831,6 +894,79 @@ function Surge_Socks5() {
     return { name, test, parse };
 }
 
+function Surge_External() {
+    const name = 'Surge External Parser';
+    const test = (line) => {
+        return /^.*=\s*external/.test(line.split(',')[0]);
+    };
+    const parse = (line) => {
+        let parsed = /^\s*(.*?)\s*?=\s*?external\s*?,\s*(.*?)\s*$/.exec(line);
+
+        // eslint-disable-next-line no-unused-vars
+        let [_, name, other] = parsed;
+        line = other;
+
+        // exec = "/usr/bin/ssh" 或 exec = /usr/bin/ssh
+        let exec = /(,|^)\s*?exec\s*?=\s*"(.*?)"\s*?(,|$)/.exec(line)?.[2];
+        if (!exec) {
+            exec = /(,|^)\s*?exec\s*?=\s*(.*?)\s*?(,|$)/.exec(line)?.[2];
+        }
+
+        // local-port = "1080" 或 local-port = 1080
+        let localPort = /(,|^)\s*?local-port\s*?=\s*"(.*?)"\s*?(,|$)/.exec(
+            line,
+        )?.[2];
+        if (!localPort) {
+            localPort = /(,|^)\s*?local-port\s*?=\s*(.*?)\s*?(,|$)/.exec(
+                line,
+            )?.[2];
+        }
+        // args = "-m", args = "rc4-md5"
+        // args = -m, args = rc4-md5
+        const argsRegex = /(,|^)\s*?args\s*?=\s*("(.*?)"|(.*?))(?=\s*?(,|$))/g;
+        let argsMatch;
+        const args = [];
+        while ((argsMatch = argsRegex.exec(line)) !== null) {
+            if (argsMatch[3] != null) {
+                args.push(argsMatch[3]);
+            } else if (argsMatch[4] != null) {
+                args.push(argsMatch[4]);
+            }
+        }
+        // addresses = "[ipv6]",,addresses = "ipv6", addresses = "ipv4"
+        // addresses = [ipv6], addresses = ipv6, addresses = ipv4
+        const addressesRegex =
+            /(,|^)\s*?addresses\s*?=\s*("(.*?)"|(.*?))(?=\s*?(,|$))/g;
+        let addressesMatch;
+        const addresses = [];
+        while ((addressesMatch = addressesRegex.exec(line)) !== null) {
+            let ip;
+            if (addressesMatch[3] != null) {
+                ip = addressesMatch[3];
+            } else if (addressesMatch[4] != null) {
+                ip = addressesMatch[4];
+            }
+            if (ip != null) {
+                ip = `${ip}`.trim().replace(/^\[/, '').replace(/\]$/, '');
+            }
+            if (isIP(ip)) {
+                addresses.push(ip);
+            }
+        }
+
+        const proxy = {
+            type: 'external',
+            name,
+            exec,
+            'local-port': localPort,
+            args,
+            addresses,
+        };
+        return proxy;
+    };
+    return { name, test, parse };
+}
+
 function Surge_Snell() {
     const name = 'Surge Snell Parser';
     const test = (line) => {
@@ -866,6 +1002,10 @@ function Surge_Hysteria2() {
     return { name, test, parse };
 }
 
+function isIP(ip) {
+    return isIPv4(ip) || isIPv6(ip);
+}
+
 export default [
     URI_SS(),
     URI_SSR(),
@@ -883,6 +1023,7 @@ export default [
     Surge_WireGuard(),
     Surge_Hysteria2(),
     Surge_Socks5(),
+    Surge_External(),
     Loon_SS(),
     Loon_SSR(),
     Loon_VMess(),
@@ -894,6 +1035,7 @@ export default [
     QX_SS(),
     QX_SSR(),
     QX_VMess(),
+    QX_VLESS(),
     QX_Trojan(),
     QX_Http(),
     QX_Socks5(),

@@ -4,6 +4,7 @@ import {
     COLLECTIONS_KEY,
     RULES_KEY,
     SUBS_KEY,
+    FILES_KEY,
 } from '@/constants';
 import { failed, success } from '@/restful/response';
 import { InternalServerError, ResourceNotFoundError } from '@/restful/errors';
@@ -31,12 +32,16 @@ async function produceArtifact({
     content,
     mergeSources,
     ignoreFailedRemoteSub,
+    ignoreFailedRemoteFile,
+    produceType,
+    produceOpts = {},
 }) {
     platform = platform || 'JSON';
 
     if (type === 'subscription') {
         const allSubs = $.read(SUBS_KEY);
         const sub = findByName(allSubs, name);
+        if (!sub) throw new Error(`找不到订阅 ${name}`);
         let raw;
         if (content && !['localFirst', 'remoteFirst'].includes(mergeSources)) {
             raw = content;
@@ -152,11 +157,12 @@ async function produceArtifact({
             exist[proxy.name] = true;
         }
         // produce
-        return ProxyUtils.produce(proxies, platform);
+        return ProxyUtils.produce(proxies, platform, produceType, produceOpts);
     } else if (type === 'collection') {
         const allSubs = $.read(SUBS_KEY);
         const allCols = $.read(COLLECTIONS_KEY);
         const collection = findByName(allCols, name);
+        if (!collection) throw new Error(`找不到组合订阅 ${name}`);
         const subnames = collection.subscriptions;
         const results = {};
         const errors = {};
@@ -299,10 +305,11 @@ async function produceArtifact({
             }
             exist[proxy.name] = true;
         }
-        return ProxyUtils.produce(proxies, platform);
+        return ProxyUtils.produce(proxies, platform, produceType, produceOpts);
     } else if (type === 'rule') {
         const allRules = $.read(RULES_KEY);
         const rule = findByName(allRules, name);
+        if (!rule) throw new Error(`找不到规则 ${name}`);
         let rules = [];
         for (let i = 0; i < rule.urls.length; i++) {
             const url = rule.urls[i];
@@ -327,31 +334,156 @@ async function produceArtifact({
         ]);
         // produce output
         return RuleUtils.produce(rules, platform);
+    } else if (type === 'file') {
+        const allFiles = $.read(FILES_KEY);
+        const file = findByName(allFiles, name);
+        if (!file) throw new Error(`找不到文件 ${name}`);
+        let raw;
+        if (content && !['localFirst', 'remoteFirst'].includes(mergeSources)) {
+            raw = content;
+        } else if (url) {
+            const errors = {};
+            raw = await Promise.all(
+                url
+                    .split(/[\r\n]+/)
+                    .map((i) => i.trim())
+                    .filter((i) => i.length)
+                    .map(async (url) => {
+                        try {
+                            return await download(url, ua || file.ua);
+                        } catch (err) {
+                            errors[url] = err;
+                            $.error(
+                                `文件 ${file.name} 的远程文件 ${url} 发生错误: ${err}`,
+                            );
+                            return '';
+                        }
+                    }),
+            );
+            let fileIgnoreFailedRemoteFile = file.ignoreFailedRemoteFile;
+            if (
+                ignoreFailedRemoteFile != null &&
+                ignoreFailedRemoteFile !== ''
+            ) {
+                fileIgnoreFailedRemoteFile = ignoreFailedRemoteFile;
+            }
+            if (!fileIgnoreFailedRemoteFile && Object.keys(errors).length > 0) {
+                throw new Error(
+                    `文件 ${file.name} 的远程文件 ${Object.keys(errors).join(
+                        ', ',
+                    )} 发生错误, 请查看日志`,
+                );
+            }
+            if (mergeSources === 'localFirst') {
+                raw.unshift(content);
+            } else if (mergeSources === 'remoteFirst') {
+                raw.push(content);
+            }
+        } else if (
+            file.source === 'local' &&
+            !['localFirst', 'remoteFirst'].includes(file.mergeSources)
+        ) {
+            raw = file.content;
+        } else {
+            const errors = {};
+            raw = await Promise.all(
+                file.url
+                    .split(/[\r\n]+/)
+                    .map((i) => i.trim())
+                    .filter((i) => i.length)
+                    .map(async (url) => {
+                        try {
+                            return await download(url, ua || file.ua);
+                        } catch (err) {
+                            errors[url] = err;
+                            $.error(
+                                `文件 ${file.name} 的远程文件 ${url} 发生错误: ${err}`,
+                            );
+                            return '';
+                        }
+                    }),
+            );
+            let fileIgnoreFailedRemoteFile = file.ignoreFailedRemoteFile;
+            if (
+                ignoreFailedRemoteFile != null &&
+                ignoreFailedRemoteFile !== ''
+            ) {
+                fileIgnoreFailedRemoteFile = ignoreFailedRemoteFile;
+            }
+            if (!fileIgnoreFailedRemoteFile && Object.keys(errors).length > 0) {
+                throw new Error(
+                    `文件 ${file.name} 的远程文件 ${Object.keys(errors).join(
+                        ', ',
+                    )} 发生错误, 请查看日志`,
+                );
+            }
+            if (file.mergeSources === 'localFirst') {
+                raw.unshift(file.content);
+            } else if (file.mergeSources === 'remoteFirst') {
+                raw.push(file.content);
+            }
+        }
+        const files = (Array.isArray(raw) ? raw : [raw]).flat();
+        let filesContent = files
+            .filter((i) => i != null && i !== '')
+            .join('\n');
+
+        // apply processors
+        const processed =
+            Array.isArray(file.process) && file.process.length > 0
+                ? await ProxyUtils.process(
+                      { $files: files, $content: filesContent },
+                      file.process,
+                  )
+                : { $content: filesContent, $files: files };
+
+        return processed?.$content ?? '';
     }
 }
 
-async function syncAllArtifacts(_, res) {
+async function syncArtifacts() {
     $.info('开始同步所有远程配置...');
     const allArtifacts = $.read(ARTIFACTS_KEY);
     const files = {};
 
     try {
+        const invalid = [];
         await Promise.all(
             allArtifacts.map(async (artifact) => {
-                if (artifact.sync) {
-                    $.info(`正在同步云配置：${artifact.name}...`);
-                    const output = await produceArtifact({
-                        type: artifact.type,
-                        name: artifact.source,
-                        platform: artifact.platform,
-                    });
+                try {
+                    if (artifact.sync && artifact.source) {
+                        $.info(`正在同步云配置：${artifact.name}...`);
+                        const output = await produceArtifact({
+                            type: artifact.type,
+                            name: artifact.source,
+                            platform: artifact.platform,
+                            produceOpts: {
+                                'include-unsupported-proxy':
+                                    artifact.includeUnsupportedProxy,
+                            },
+                        });
 
-                    files[artifact.name] = {
-                        content: output,
-                    };
+                        // if (!output || output.length === 0)
+                        //     throw new Error('该配置的结果为空 不进行上传');
+
+                        files[encodeURIComponent(artifact.name)] = {
+                            content: output,
+                        };
+                    }
+                } catch (e) {
+                    $.error(
+                        `同步配置 ${artifact.name} 发生错误: ${e.message ?? e}`,
+                    );
+                    invalid.push(artifact.name);
                 }
             }),
         );
+
+        if (invalid.length > 0) {
+            throw new Error(
+                `同步配置 ${invalid.join(', ')} 发生错误 详情请查看日志`,
+            );
+        }
 
         const resp = await syncToGist(files);
         const body = JSON.parse(resp.body);
@@ -360,41 +492,73 @@ async function syncAllArtifacts(_, res) {
             if (artifact.sync) {
                 artifact.updated = new Date().getTime();
                 // extract real url from gist
-                artifact.url = body.files[artifact.name].raw_url.replace(
-                    /\/raw\/[^/]*\/(.*)/,
-                    '/raw/$1',
-                );
+                let files = body.files;
+                let isGitLab;
+                if (Array.isArray(files)) {
+                    isGitLab = true;
+                    files = Object.fromEntries(
+                        files.map((item) => [item.path, item]),
+                    );
+                }
+                const url = files[encodeURIComponent(artifact.name)]?.raw_url;
+                artifact.url = isGitLab
+                    ? url
+                    : url?.replace(/\/raw\/[^/]*\/(.*)/, '/raw/$1');
             }
         }
 
         $.write(allArtifacts, ARTIFACTS_KEY);
         $.info('全部订阅同步成功！');
+    } catch (e) {
+        $.error(`同步订阅失败，原因：${e.message ?? e}`);
+        throw e;
+    }
+}
+async function syncAllArtifacts(_, res) {
+    $.info('开始同步所有远程配置...');
+    try {
+        await syncArtifacts();
         success(res);
-    } catch (err) {
+    } catch (e) {
+        $.error(`同步订阅失败，原因：${e.message ?? e}`);
         failed(
             res,
             new InternalServerError(
                 `FAILED_TO_SYNC_ARTIFACTS`,
                 `Failed to sync all artifacts`,
-                `Reason: ${err}`,
+                `Reason: ${e.message ?? e}`,
             ),
         );
-        $.info(`同步订阅失败，原因：${err}`);
     }
 }
 
 async function syncArtifact(req, res) {
     let { name } = req.params;
     name = decodeURIComponent(name);
+    $.info(`开始同步远程配置 ${name}...`);
     const allArtifacts = $.read(ARTIFACTS_KEY);
     const artifact = findByName(allArtifacts, name);
 
     if (!artifact) {
+        $.error(`找不到远程配置 ${name}`);
         failed(
             res,
             new ResourceNotFoundError(
                 'RESOURCE_NOT_FOUND',
-                `Artifact ${name} does not exist!`,
+                `找不到远程配置 ${name}`,
+            ),
+            404,
+        );
+        return;
+    }
+
+    if (!artifact.source) {
+        $.error(`远程配置 ${name} 未设置来源`);
+        failed(
+            res,
+            new ResourceNotFoundError(
+                'RESOURCE_HAS_NO_SOURCE',
+                `远程配置 ${name} 未设置来源`,
             ),
             404,
         );
@@ -406,6 +570,9 @@ async function syncArtifact(req, res) {
             type: artifact.type,
             name: artifact.source,
             platform: artifact.platform,
+            produceOpts: {
+                'include-unsupported-proxy': artifact.includeUnsupportedProxy,
+            },
         });
 
         $.info(
@@ -415,6 +582,8 @@ async function syncArtifact(req, res) {
                 2,
             )}`,
         );
+        // if (!output || output.length === 0)
+        //     throw new Error('该配置的结果为空 不进行上传');
         const resp = await syncToGist({
             [encodeURIComponent(artifact.name)]: {
                 content: output,
@@ -422,12 +591,20 @@ async function syncArtifact(req, res) {
         });
         artifact.updated = new Date().getTime();
         const body = JSON.parse(resp.body);
-        artifact.url = body.files[
-            encodeURIComponent(artifact.name)
-        ].raw_url.replace(/\/raw\/[^/]*\/(.*)/, '/raw/$1');
+        let files = body.files;
+        let isGitLab;
+        if (Array.isArray(files)) {
+            isGitLab = true;
+            files = Object.fromEntries(files.map((item) => [item.path, item]));
+        }
+        const url = files[encodeURIComponent(artifact.name)]?.raw_url;
+        artifact.url = isGitLab
+            ? url
+            : url?.replace(/\/raw\/[^/]*\/(.*)/, '/raw/$1');
         $.write(allArtifacts, ARTIFACTS_KEY);
         success(res, artifact);
     } catch (err) {
+        $.error(`远程配置 ${artifact.name} 发生错误: ${err.message ?? err}`);
         failed(
             res,
             new InternalServerError(
@@ -439,4 +616,4 @@ async function syncArtifact(req, res) {
     }
 }
 
-export { produceArtifact };
+export { produceArtifact, syncArtifacts };

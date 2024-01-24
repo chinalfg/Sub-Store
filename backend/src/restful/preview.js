@@ -9,6 +9,85 @@ import $ from '@/core/app';
 export default function register($app) {
     $app.post('/api/preview/sub', compareSub);
     $app.post('/api/preview/collection', compareCollection);
+    $app.post('/api/preview/file', previewFile);
+}
+
+async function previewFile(req, res) {
+    try {
+        const file = req.body;
+        let content;
+        if (
+            file.source === 'local' &&
+            !['localFirst', 'remoteFirst'].includes(file.mergeSources)
+        ) {
+            content = file.content;
+        } else {
+            const errors = {};
+            content = await Promise.all(
+                file.url
+                    .split(/[\r\n]+/)
+                    .map((i) => i.trim())
+                    .filter((i) => i.length)
+                    .map(async (url) => {
+                        try {
+                            return await download(url, file.ua);
+                        } catch (err) {
+                            errors[url] = err;
+                            $.error(
+                                `文件 ${file.name} 的远程文件 ${url} 发生错误: ${err}`,
+                            );
+                            return '';
+                        }
+                    }),
+            );
+
+            if (
+                !file.ignoreFailedRemoteFile &&
+                Object.keys(errors).length > 0
+            ) {
+                throw new Error(
+                    `文件 ${file.name} 的远程文件 ${Object.keys(errors).join(
+                        ', ',
+                    )} 发生错误, 请查看日志`,
+                );
+            }
+            if (file.mergeSources === 'localFirst') {
+                content.unshift(file.content);
+            } else if (file.mergeSources === 'remoteFirst') {
+                content.push(file.content);
+            }
+        }
+        // parse proxies
+        const files = (Array.isArray(content) ? content : [content]).flat();
+        let filesContent = files
+            .filter((i) => i != null && i !== '')
+            .join('\n');
+
+        // apply processors
+        const processed =
+            Array.isArray(file.process) && file.process.length > 0
+                ? await ProxyUtils.process(
+                      { $files: files, $content: filesContent },
+                      file.process,
+                  )
+                : { $content: filesContent, $files: files };
+
+        // produce
+        success(res, {
+            original: filesContent,
+            processed: processed?.$content ?? '',
+        });
+    } catch (err) {
+        $.error(err.message ?? err);
+        failed(
+            res,
+            new InternalServerError(
+                `INTERNAL_SERVER_ERROR`,
+                `Failed to preview file`,
+                `Reason: ${err.message ?? err}`,
+            ),
+        );
+    }
 }
 
 async function compareSub(req, res) {
